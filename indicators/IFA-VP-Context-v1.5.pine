@@ -1,0 +1,635 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)
+// © EDUVEST - IFA × VP Context v1.5 (Final Release)
+// Market Context Indicator - Beginner Friendly Edition
+// NOT a buy/sell signal - Shows market environment for your own decisions
+//
+// Architecture: Core / Adapter / UI 3-Layer
+// Performance: VP calculation on bar close only, pre-allocated objects with set() updates
+
+//@version=6
+indicator('IFA-VP Context v1.5', 'IFA-VP', overlay=true,
+     max_boxes_count=200,
+     max_lines_count=150,
+     max_labels_count=100)
+
+//=============================================================================
+// CONSTANTS
+//=============================================================================
+
+int BULLISH = 1
+int BEARISH = -1
+int NEUTRAL = 0
+
+string MODE_IMPACT = 'Impact'
+string MODE_MINIMAL = 'Minimal'
+string MODE_PRO = 'Pro'
+
+//=============================================================================
+// INPUTS - Display Mode
+//=============================================================================
+
+string GROUP_MODE = '🎨 Display Mode'
+string i_mode = input.string(MODE_IMPACT, 'Mode', options=[MODE_IMPACT, MODE_MINIMAL, MODE_PRO], group=GROUP_MODE,
+     tooltip='Impact: Visual emphasis with badges and ribbons\nMinimal: Clean lines only\nPro: Full Volume Profile histogram')
+
+//=============================================================================
+// INPUTS - SMA Settings
+//=============================================================================
+
+string GROUP_SMA = '🎯 SMA Settings'
+bool i_showSma = input.bool(true, 'Show SMA Lines', group=GROUP_SMA)
+bool i_showSma20 = input.bool(true, 'SMA 20', group=GROUP_SMA, inline='sma20')
+color i_sma20Color = input.color(#00FFFF, '', group=GROUP_SMA, inline='sma20')
+bool i_showSma50 = input.bool(true, 'SMA 50', group=GROUP_SMA, inline='sma50')
+color i_sma50Color = input.color(#FF6B00, '', group=GROUP_SMA, inline='sma50')
+bool i_showSma200 = input.bool(true, 'SMA 200', group=GROUP_SMA, inline='sma200')
+color i_sma200Color = input.color(#FF00FF, '', group=GROUP_SMA, inline='sma200')
+int i_smaWidth = input.int(2, 'Line Width', group=GROUP_SMA, minval=1, maxval=5)
+bool i_showSmaCross = input.bool(true, 'Show Cross Signals', group=GROUP_SMA,
+     tooltip='Show triangles when SMA crosses occur (trend change signals)')
+
+//=============================================================================
+// INPUTS - Volume Profile
+//=============================================================================
+
+string GROUP_VP = '📊 Volume Profile'
+int i_vpLookback = input.int(100, 'Lookback (bars)', group=GROUP_VP, minval=20, maxval=500,
+     tooltip='Number of bars to calculate Volume Profile')
+int i_vpRows = input.int(24, 'Price Levels', group=GROUP_VP, minval=10, maxval=50,
+     tooltip='Number of price levels to divide the range')
+float i_vaPercent = input.float(70, 'Value Area (%)', group=GROUP_VP, minval=50, maxval=95, step=5,
+     tooltip='Percentage of volume that defines the Value Area')
+
+//=============================================================================
+// INPUTS - POC/VA Display
+//=============================================================================
+
+string GROUP_POC = '📍 POC / Value Area'
+color i_pocColor = input.color(#FF9800, 'POC Color', group=GROUP_POC)
+int i_pocWidth = input.int(2, 'POC Width', group=GROUP_POC, minval=1, maxval=5)
+color i_vahColor = input.color(#26A69A, 'VAH Color', group=GROUP_POC)
+color i_valColor = input.color(#EF5350, 'VAL Color', group=GROUP_POC)
+bool i_showVaLabels = input.bool(true, 'Show Price Labels', group=GROUP_POC)
+
+//=============================================================================
+// INPUTS - Impact Mode Features
+//=============================================================================
+
+string GROUP_IMPACT = '✨ Impact Features'
+int i_vaFillOpacity = input.int(92, 'VA Band Opacity', group=GROUP_IMPACT, minval=80, maxval=98,
+     tooltip='Higher = more transparent')
+int i_pocZoneOpacity = input.int(85, 'POC Zone Opacity', group=GROUP_IMPACT, minval=70, maxval=95)
+bool i_showContextBadge = input.bool(true, 'Context Badge', group=GROUP_IMPACT,
+     tooltip='Shows LONG FAVORABLE / SHORT FAVORABLE / NEUTRAL status')
+bool i_showPocReaction = input.bool(true, 'POC Reaction Marker', group=GROUP_IMPACT,
+     tooltip='Shows when price enters POC zone')
+bool i_showTrendRibbon = input.bool(true, 'Trend Ribbon', group=GROUP_IMPACT,
+     tooltip='Fill between SMA20 and SMA50')
+bool i_showContextHeat = input.bool(true, 'Context Heat Glow', group=GROUP_IMPACT,
+     tooltip='Background glow when context score >= 70')
+string i_badgeSize = input.string('large', 'Badge Size', options=['normal', 'large'], group=GROUP_IMPACT)
+
+//=============================================================================
+// INPUTS - Pro Mode (VP Full)
+//=============================================================================
+
+string GROUP_PRO = '📈 Pro Mode (VP Histogram)'
+int i_vpWidth = input.int(10, 'Profile Width', group=GROUP_PRO, minval=5, maxval=30)
+color i_bullVolColor = input.color(color.new(#4CAF50, 70), 'Bull Volume', group=GROUP_PRO)
+color i_bearVolColor = input.color(color.new(#F44336, 70), 'Bear Volume', group=GROUP_PRO)
+color i_hvnColor = input.color(color.new(#FFD700, 60), 'HVN (High Vol Node)', group=GROUP_PRO)
+color i_lvnColor = input.color(color.new(#808080, 80), 'LVN (Low Vol Node)', group=GROUP_PRO)
+
+//=============================================================================
+// INPUTS - Alerts
+//=============================================================================
+
+string GROUP_ALERT = '🔔 Alerts'
+bool i_alertsEnabled = input.bool(true, 'Enable Alerts', group=GROUP_ALERT)
+bool i_alertPoc = input.bool(true, 'POC Reaction', group=GROUP_ALERT)
+bool i_alertCross = input.bool(true, 'SMA Cross', group=GROUP_ALERT)
+bool i_alertContext = input.bool(true, 'Context Change', group=GROUP_ALERT)
+
+//=============================================================================
+// CORE LAYER: Trend Indicators (calculated every bar)
+//=============================================================================
+
+// ATR for dynamic thresholds (calculated once per bar, not in conditionals)
+float atr14 = ta.atr(14)
+
+// SMA calculations
+float sma20 = ta.sma(close, 20)
+float sma50 = ta.sma(close, 50)
+float sma200 = ta.sma(close, 200)
+
+// SMA cross detection (confirmed on bar close - no repaint)
+bool goldenCross20x50 = ta.crossover(sma20, sma50)
+bool deadCross20x50 = ta.crossunder(sma20, sma50)
+bool goldenCross50x200 = ta.crossover(sma50, sma200)
+bool deadCross50x200 = ta.crossunder(sma50, sma200)
+
+// Cross pulse (for visual emphasis in Impact mode)
+bool goldenPulse20x50 = ta.barssince(goldenCross20x50) <= 3
+bool deadPulse20x50 = ta.barssince(deadCross20x50) <= 3
+bool goldenPulse50x200 = ta.barssince(goldenCross50x200) <= 5
+bool deadPulse50x200 = ta.barssince(deadCross50x200) <= 5
+
+// SMA alignment (trend structure)
+bool smaBullAligned = sma20 > sma50 and sma50 > sma200
+bool smaBearAligned = sma20 < sma50 and sma50 < sma200
+
+//=============================================================================
+// CORE LAYER: Volume Profile Calculation (on bar close only)
+//=============================================================================
+
+// Cached VP values (persistent)
+var float pocPrice = na
+var float vahPrice = na
+var float valPrice = na
+var float vpHigh = na
+var float vpLow = na
+var int vpStartBar = 0
+var float vpRowSize = na
+var float vpMaxVolume = 0.0
+
+// VP arrays (persistent, updated on bar close)
+var float[] volumeByPrice = array.new_float(i_vpRows, 0)
+var float[] bullVolume = array.new_float(i_vpRows, 0)
+var float[] bearVolume = array.new_float(i_vpRows, 0)
+
+// VP calculation function
+calcVolumeProfile() =>
+    float hPrice = ta.highest(high, i_vpLookback)
+    float lPrice = ta.lowest(low, i_vpLookback)
+    float pRange = hPrice - lPrice
+    float rowSz = pRange > 0 ? pRange / i_vpRows : syminfo.mintick
+
+    // Reset arrays
+    array.fill(volumeByPrice, 0.0)
+    array.fill(bullVolume, 0.0)
+    array.fill(bearVolume, 0.0)
+
+    // Accumulate volume by price level
+    for i = 0 to i_vpLookback - 1
+        float p = close[i]
+        float v = volume[i]
+        bool isBull = close[i] >= open[i]
+
+        int row = rowSz > 0 ? int(math.floor((p - lPrice) / rowSz)) : 0
+        row := math.max(0, math.min(i_vpRows - 1, row))
+
+        array.set(volumeByPrice, row, array.get(volumeByPrice, row) + v)
+        if isBull
+            array.set(bullVolume, row, array.get(bullVolume, row) + v)
+        else
+            array.set(bearVolume, row, array.get(bearVolume, row) + v)
+
+    // Find POC (max volume row)
+    float maxVol = array.max(volumeByPrice)
+    int pocRow = array.indexof(volumeByPrice, maxVol)
+    float pocP = lPrice + (pocRow + 0.5) * rowSz
+
+    // Calculate Value Area (expanding from POC until target % reached)
+    float totalVol = array.sum(volumeByPrice)
+    float targetVol = totalVol * i_vaPercent / 100
+
+    int vahRow = pocRow
+    int valRow = pocRow
+    float accVol = array.get(volumeByPrice, pocRow)
+
+    if totalVol > 0
+        while accVol < targetVol and (vahRow < i_vpRows - 1 or valRow > 0)
+            float upperV = vahRow < i_vpRows - 1 ? array.get(volumeByPrice, vahRow + 1) : 0.0
+            float lowerV = valRow > 0 ? array.get(volumeByPrice, valRow - 1) : 0.0
+
+            if upperV > lowerV and vahRow < i_vpRows - 1
+                vahRow += 1
+                accVol += upperV
+            else if valRow > 0
+                valRow -= 1
+                accVol += lowerV
+            else
+                break
+
+    float vahP = lPrice + (vahRow + 1) * rowSz
+    float valP = lPrice + valRow * rowSz
+
+    [pocP, vahP, valP, hPrice, lPrice, maxVol, rowSz]
+
+// Execute VP calculation ONLY on confirmed bar close (no repaint)
+if barstate.isconfirmed and bar_index >= i_vpLookback
+    [p, vh, vl, h, l, mv, rs] = calcVolumeProfile()
+    pocPrice := p
+    vahPrice := vh
+    valPrice := vl
+    vpHigh := h
+    vpLow := l
+    vpMaxVolume := mv
+    vpRowSize := rs
+    vpStartBar := bar_index - i_vpLookback
+
+//=============================================================================
+// ADAPTER LAYER: Zone & Score Calculation (every bar)
+//=============================================================================
+
+// POC zone threshold (based on ATR)
+float pocThreshold = not na(atr14) ? atr14 * 0.15 : syminfo.mintick * 10
+
+// Price zone determination
+string priceZone = 'unknown'
+if not na(vahPrice) and not na(valPrice)
+    if close > vahPrice
+        priceZone := 'above_vah'
+    else if close < valPrice
+        priceZone := 'below_val'
+    else if not na(pocPrice) and math.abs(close - pocPrice) < pocThreshold
+        priceZone := 'at_poc'
+    else
+        priceZone := 'in_va'
+
+// POC proximity state machine
+bool inPocZone = not na(pocPrice) and math.abs(close - pocPrice) < pocThreshold
+
+var bool prevInPocZone = false
+bool pocEnter = inPocZone and not prevInPocZone
+bool pocExit = not inPocZone and prevInPocZone
+prevInPocZone := inPocZone
+
+string pocState = pocEnter ? 'ENTER' : inPocZone ? 'IN' : pocExit ? 'EXIT' : 'OUT'
+
+// Context Score calculation
+int bullScore = 0
+int bearScore = 0
+
+// SMA alignment: +40
+if smaBullAligned
+    bullScore += 40
+if smaBearAligned
+    bearScore += 40
+
+// Price zone: +30 or +20 or +10
+if priceZone == 'above_vah'
+    bullScore += 30
+else if priceZone == 'below_val'
+    bearScore += 30
+else if priceZone == 'at_poc'
+    bullScore += 20
+    bearScore += 20
+else if priceZone == 'in_va'
+    bullScore += 10
+    bearScore += 10
+
+// Clamp scores
+bullScore := math.min(100, bullScore)
+bearScore := math.min(100, bearScore)
+
+// Determine context bias
+int contextBias = bullScore > bearScore ? BULLISH : bearScore > bullScore ? BEARISH : NEUTRAL
+int contextScore = math.max(bullScore, bearScore)
+bool strongContext = contextScore >= 70
+
+// Context change detection (for alerts)
+var int prevContextBias = NEUTRAL
+bool contextChanged = contextBias != prevContextBias and contextBias != NEUTRAL
+prevContextBias := contextBias
+
+//=============================================================================
+// ADAPTER LAYER: Beginner-Friendly Status
+//=============================================================================
+
+// Favorable conditions
+bool isLongFavorable = contextScore >= 70 and smaBullAligned and (priceZone == 'above_vah' or priceZone == 'at_poc')
+bool isShortFavorable = contextScore >= 70 and smaBearAligned and (priceZone == 'below_val' or priceZone == 'at_poc')
+
+// Main status
+string mainStatus = isLongFavorable ? 'LONG FAVORABLE' : isShortFavorable ? 'SHORT FAVORABLE' : contextScore >= 50 ? 'NEUTRAL - WAIT' : 'LOW CONFIDENCE'
+string mainIcon = isLongFavorable ? '🟢' : isShortFavorable ? '🔴' : contextScore >= 50 ? '⚪' : '⚠️'
+color mainColor = isLongFavorable ? color.new(#26A69A, 0) : isShortFavorable ? color.new(#EF5350, 0) : contextScore >= 50 ? color.gray : color.new(#FFC107, 0)
+
+// Action guidance
+string actionGuide = isLongFavorable ? (priceZone == 'above_vah' ? 'Bullish breakout zone' : priceZone == 'at_poc' ? 'POC support test' : 'Uptrend active') : isShortFavorable ? (priceZone == 'below_val' ? 'Bearish breakdown zone' : priceZone == 'at_poc' ? 'POC resistance test' : 'Downtrend active') : contextScore >= 50 ? 'No clear edge - wait' : 'Trend unclear'
+
+//=============================================================================
+// UI LAYER: Pre-allocated Drawing Objects
+//=============================================================================
+
+var line linePoc = na
+var line lineVah = na
+var line lineVal = na
+var label labelPoc = na
+var label labelVah = na
+var label labelVal = na
+
+var box boxVaFill = na
+var box boxPocZone = na
+var box boxContextHeat = na
+var label labelContextBadge = na
+var label labelPocReaction = na
+
+var box[] boxesVpFull = array.new_box()
+var bool boxesInitialized = false
+
+// Initialize objects on first bar
+if barstate.isfirst
+    linePoc := line.new(bar_index, na, bar_index, na, xloc=xloc.bar_index, color=i_pocColor, width=i_pocWidth)
+    lineVah := line.new(bar_index, na, bar_index, na, xloc=xloc.bar_index, color=i_vahColor, width=2, style=line.style_dashed)
+    lineVal := line.new(bar_index, na, bar_index, na, xloc=xloc.bar_index, color=i_valColor, width=2, style=line.style_dashed)
+
+    labelPoc := label.new(bar_index, na, '', xloc=xloc.bar_index, color=color.new(i_pocColor, 70), textcolor=color.white, style=label.style_label_left, size=size.normal)
+    labelVah := label.new(bar_index, na, '', xloc=xloc.bar_index, color=color.new(i_vahColor, 50), textcolor=color.white, style=label.style_label_left, size=size.small)
+    labelVal := label.new(bar_index, na, '', xloc=xloc.bar_index, color=color.new(i_valColor, 50), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+    boxVaFill := box.new(bar_index, na, bar_index, na, xloc=xloc.bar_index, border_color=color.new(color.gray, 100), bgcolor=color.new(#9C27B0, 92))
+    boxPocZone := box.new(bar_index, na, bar_index, na, xloc=xloc.bar_index, border_color=color.new(i_pocColor, 80), bgcolor=color.new(i_pocColor, 85))
+    boxContextHeat := box.new(bar_index, na, bar_index, na, xloc=xloc.bar_index, border_color=color.new(color.gray, 100), bgcolor=color.new(color.gray, 90))
+
+    labelContextBadge := label.new(bar_index, na, '', xloc=xloc.bar_index, color=color.new(color.gray, 30), textcolor=color.white, style=label.style_label_up, size=size.large)
+    labelPocReaction := label.new(bar_index, na, '', xloc=xloc.bar_index, color=color.new(i_pocColor, 20), textcolor=color.white, style=label.style_label_center, size=size.normal)
+
+// Initialize VP Full boxes (Pro mode only)
+bool showVpFull = i_mode == MODE_PRO
+bool needReinitBoxes = showVpFull and (not boxesInitialized or array.size(boxesVpFull) != i_vpRows)
+
+if needReinitBoxes
+    if array.size(boxesVpFull) > 0
+        for j = 0 to array.size(boxesVpFull) - 1
+            box.delete(array.get(boxesVpFull, j))
+        array.clear(boxesVpFull)
+
+    for i = 0 to i_vpRows - 1
+        array.push(boxesVpFull, box.new(0, na, 0, na, xloc=xloc.bar_index, border_color=color.new(color.gray, 50), bgcolor=color.new(color.gray, 80)))
+
+    boxesInitialized := true
+
+//=============================================================================
+// UI LAYER: Drawing Updates (on last bar only)
+//=============================================================================
+
+if barstate.islast
+    int hideX = bar_index
+    bool showImpact = i_mode == MODE_IMPACT or i_mode == MODE_PRO
+
+    // ----- POC / VAH / VAL Lines -----
+    if not na(pocPrice)
+        int startX = vpStartBar > 0 ? vpStartBar : bar_index - i_vpLookback
+        int endX = bar_index + 10
+
+        line.set_xy1(linePoc, startX, pocPrice)
+        line.set_xy2(linePoc, endX, pocPrice)
+        line.set_color(linePoc, i_pocColor)
+        line.set_width(linePoc, i_pocWidth)
+
+        line.set_xy1(lineVah, startX, vahPrice)
+        line.set_xy2(lineVah, endX, vahPrice)
+        line.set_color(lineVah, i_vahColor)
+
+        line.set_xy1(lineVal, startX, valPrice)
+        line.set_xy2(lineVal, endX, valPrice)
+        line.set_color(lineVal, i_valColor)
+
+        if i_showVaLabels
+            label.set_xy(labelPoc, endX, pocPrice)
+            label.set_text(labelPoc, 'POC ' + str.tostring(pocPrice, format.mintick))
+            label.set_color(labelPoc, color.new(i_pocColor, 70))
+
+            label.set_xy(labelVah, endX, vahPrice)
+            label.set_text(labelVah, 'VAH ' + str.tostring(vahPrice, format.mintick))
+            label.set_color(labelVah, color.new(i_vahColor, 50))
+
+            label.set_xy(labelVal, endX, valPrice)
+            label.set_text(labelVal, 'VAL ' + str.tostring(valPrice, format.mintick))
+            label.set_color(labelVal, color.new(i_valColor, 50))
+        else
+            label.set_xy(labelPoc, hideX, na)
+            label.set_xy(labelVah, hideX, na)
+            label.set_xy(labelVal, hideX, na)
+    else
+        line.set_xy1(linePoc, hideX, na)
+        line.set_xy2(linePoc, hideX, na)
+        line.set_xy1(lineVah, hideX, na)
+        line.set_xy2(lineVah, hideX, na)
+        line.set_xy1(lineVal, hideX, na)
+        line.set_xy2(lineVal, hideX, na)
+        label.set_xy(labelPoc, hideX, na)
+        label.set_xy(labelVah, hideX, na)
+        label.set_xy(labelVal, hideX, na)
+
+    // ----- VA Fill & POC Zone (Impact/Pro) -----
+    if showImpact and not na(vahPrice) and not na(valPrice)
+        int startX = vpStartBar > 0 ? vpStartBar : bar_index - i_vpLookback
+        int endX = bar_index + 5
+
+        color vaFillCol = color.new(#9C27B0, i_vaFillOpacity)
+        box.set_lefttop(boxVaFill, startX, vahPrice)
+        box.set_rightbottom(boxVaFill, endX, valPrice)
+        box.set_bgcolor(boxVaFill, vaFillCol)
+        box.set_border_color(boxVaFill, color.new(#9C27B0, 95))
+
+        if not na(pocPrice) and not na(atr14)
+            float pocZoneTop = pocPrice + atr14 * 0.1
+            float pocZoneBottom = pocPrice - atr14 * 0.1
+            color pocZoneCol = color.new(i_pocColor, i_pocZoneOpacity)
+            box.set_lefttop(boxPocZone, startX, pocZoneTop)
+            box.set_rightbottom(boxPocZone, endX, pocZoneBottom)
+            box.set_bgcolor(boxPocZone, pocZoneCol)
+            box.set_border_color(boxPocZone, color.new(i_pocColor, 80))
+        else
+            box.set_lefttop(boxPocZone, hideX, na)
+            box.set_rightbottom(boxPocZone, hideX, na)
+    else
+        box.set_lefttop(boxVaFill, hideX, na)
+        box.set_rightbottom(boxVaFill, hideX, na)
+        box.set_lefttop(boxPocZone, hideX, na)
+        box.set_rightbottom(boxPocZone, hideX, na)
+
+    // ----- Context Heat (Background glow when strong) -----
+    if showImpact and i_showContextHeat and strongContext and not na(vpHigh) and not na(vpLow)
+        color heatCol = contextBias == BULLISH ? color.new(#26A69A, 90) : color.new(#EF5350, 90)
+        box.set_lefttop(boxContextHeat, bar_index - 5, vpHigh)
+        box.set_rightbottom(boxContextHeat, bar_index + 20, vpLow)
+        box.set_bgcolor(boxContextHeat, heatCol)
+        box.set_border_color(boxContextHeat, color.new(color.gray, 100))
+    else
+        box.set_lefttop(boxContextHeat, hideX, na)
+        box.set_rightbottom(boxContextHeat, hideX, na)
+
+    // ----- Context Badge -----
+    if showImpact and i_showContextBadge
+        string badgeLine1 = mainIcon + ' ' + mainStatus
+        string badgeLine2 = 'Score: ' + str.tostring(contextScore) + '/100'
+        string badgeText = badgeLine1 + '\n' + badgeLine2
+
+        color badgeCol = isLongFavorable ? color.new(#26A69A, 10) : isShortFavorable ? color.new(#EF5350, 10) : contextScore >= 50 ? color.new(color.gray, 30) : color.new(#FFC107, 20)
+
+        float atrOffset = not na(atr14) ? atr14 * 0.6 : syminfo.mintick * 50
+        float badgeY = isLongFavorable ? low - atrOffset : high + atrOffset
+
+        label.set_xy(labelContextBadge, bar_index, badgeY)
+        label.set_text(labelContextBadge, badgeText)
+        label.set_color(labelContextBadge, badgeCol)
+        label.set_style(labelContextBadge, isLongFavorable or (not isShortFavorable and contextBias == BULLISH) ? label.style_label_up : label.style_label_down)
+        label.set_size(labelContextBadge, i_badgeSize == 'large' ? size.large : size.normal)
+        label.set_textcolor(labelContextBadge, color.white)
+    else
+        label.set_xy(labelContextBadge, hideX, na)
+
+    // ----- POC Reaction Badge -----
+    if showImpact and i_showPocReaction and (inPocZone or pocExit) and not na(pocPrice)
+        string pocBadgeIcon = pocEnter ? '◆ ' : inPocZone ? '● ' : '○ '
+        string pocBadgeText = pocBadgeIcon + 'POC ' + pocState
+        color pocBadgeCol = pocEnter ? color.new(i_pocColor, 10) : inPocZone ? color.new(i_pocColor, 30) : color.new(i_pocColor, 60)
+
+        label.set_xy(labelPocReaction, bar_index, pocPrice)
+        label.set_text(labelPocReaction, pocBadgeText)
+        label.set_color(labelPocReaction, pocBadgeCol)
+        label.set_size(labelPocReaction, i_badgeSize == 'large' ? size.large : size.normal)
+    else
+        label.set_xy(labelPocReaction, hideX, na)
+
+    // ----- VP Full Histogram (Pro mode) -----
+    if i_mode == MODE_PRO and boxesInitialized and not na(vpHigh) and vpMaxVolume > 0 and not na(vpRowSize) and vpRowSize > 0
+        int startX = vpStartBar > 0 ? vpStartBar : bar_index - i_vpLookback
+
+        for i = 0 to i_vpRows - 1
+            if i < array.size(boxesVpFull) and i < array.size(volumeByPrice)
+                float vol = array.get(volumeByPrice, i)
+                float bVol = array.get(bullVolume, i)
+                box b = array.get(boxesVpFull, i)
+
+                if vol > 0
+                    int barW = math.max(1, int(math.round((vol / vpMaxVolume) * i_vpWidth)))
+                    float priceBottom = vpLow + i * vpRowSize
+                    float priceTop = priceBottom + vpRowSize
+
+                    float bullRatio = vol > 0 ? bVol / vol : 0.5
+                    bool isHvn = vol > vpMaxVolume * 0.7
+                    bool isLvn = vol < vpMaxVolume * 0.3
+
+                    color barCol = isHvn ? i_hvnColor : isLvn ? i_lvnColor : bullRatio > 0.5 ? i_bullVolColor : i_bearVolColor
+
+                    box.set_lefttop(b, startX, priceTop)
+                    box.set_rightbottom(b, startX + barW, priceBottom)
+                    box.set_bgcolor(b, barCol)
+                    box.set_border_color(b, color.new(barCol, 30))
+                else
+                    box.set_lefttop(b, startX, na)
+                    box.set_rightbottom(b, startX, na)
+    else if boxesInitialized and array.size(boxesVpFull) > 0
+        for i = 0 to array.size(boxesVpFull) - 1
+            box b = array.get(boxesVpFull, i)
+            box.set_lefttop(b, hideX, na)
+            box.set_rightbottom(b, hideX, na)
+
+//=============================================================================
+// UI LAYER: SMA Lines & Trend Ribbon
+//=============================================================================
+
+p_sma20 = plot(i_showSma and i_showSma20 ? sma20 : na, 'SMA 20', i_sma20Color, i_smaWidth)
+p_sma50 = plot(i_showSma and i_showSma50 ? sma50 : na, 'SMA 50', i_sma50Color, i_smaWidth)
+plot(i_showSma and i_showSma200 ? sma200 : na, 'SMA 200', i_sma200Color, i_smaWidth)
+
+// Trend Ribbon (Impact/Pro only)
+bool showRibbon = (i_mode == MODE_IMPACT or i_mode == MODE_PRO) and i_showTrendRibbon and i_showSma
+color ribbonCol = sma20 > sma50 ? color.new(#26A69A, 85) : color.new(#EF5350, 85)
+fill(p_sma20, p_sma50, showRibbon ? ribbonCol : na, title='Trend Ribbon')
+
+//=============================================================================
+// UI LAYER: SMA Cross Signals (with beginner-friendly labels)
+//=============================================================================
+
+// Minor crosses (20×50)
+plotshape(i_showSmaCross and goldenCross20x50, 'Uptrend Start', shape.triangleup, location.belowbar, color.new(#00E676, 0), size=size.small, text='📈 Uptrend', textcolor=color.new(#00E676, 0))
+plotshape(i_showSmaCross and deadCross20x50, 'Downtrend Start', shape.triangledown, location.abovebar, color.new(#FF5252, 0), size=size.small, text='📉 Downtrend', textcolor=color.new(#FF5252, 0))
+
+// Major crosses (50×200)
+plotshape(i_showSmaCross and goldenCross50x200, 'MAJOR Uptrend', shape.triangleup, location.belowbar, color.new(#FFD700, 0), size=size.normal, text='🚀 MAJOR UP', textcolor=color.new(#FFD700, 0))
+plotshape(i_showSmaCross and deadCross50x200, 'MAJOR Downtrend', shape.triangledown, location.abovebar, color.new(#FF00FF, 0), size=size.normal, text='💥 MAJOR DOWN', textcolor=color.new(#FF00FF, 0))
+
+// Pulse effect (Impact/Pro)
+bool showPulse = i_mode == MODE_IMPACT or i_mode == MODE_PRO
+plotshape(showPulse and i_showSmaCross and goldenPulse20x50 and not goldenCross20x50, 'GC Pulse', shape.circle, location.belowbar, color.new(#00E676, 50), size=size.tiny)
+plotshape(showPulse and i_showSmaCross and deadPulse20x50 and not deadCross20x50, 'DC Pulse', shape.circle, location.abovebar, color.new(#FF5252, 50), size=size.tiny)
+
+//=============================================================================
+// UI LAYER: POC Reaction History (persistent markers)
+//=============================================================================
+
+bool showPocMarker = (i_mode == MODE_IMPACT or i_mode == MODE_PRO) and i_showPocReaction
+float pocMarkerPrice = showPocMarker and pocEnter ? pocPrice : na
+plot(pocMarkerPrice, 'POC Reaction', i_pocColor, 4, plot.style_circles)
+
+//=============================================================================
+// UI LAYER: Information Table
+//=============================================================================
+
+var table tblInfo = table.new(position.bottom_right, 2, 7, frame_color=color.new(color.gray, 50), frame_width=1, border_width=1)
+
+if barstate.islast
+    // Header with status color
+    color headerBg = isLongFavorable ? color.new(#26A69A, 30) : isShortFavorable ? color.new(#EF5350, 30) : color.new(color.gray, 30)
+
+    table.cell(tblInfo, 0, 0, 'STATUS', bgcolor=headerBg, text_color=color.white, text_size=size.small)
+    table.cell(tblInfo, 1, 0, mainIcon + ' ' + mainStatus, bgcolor=headerBg, text_color=color.white, text_size=size.small)
+
+    // Score
+    string scoreStrength = contextScore >= 70 ? '(Strong)' : contextScore >= 50 ? '(Moderate)' : '(Weak)'
+    table.cell(tblInfo, 0, 1, 'Score', bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    table.cell(tblInfo, 1, 1, str.tostring(contextScore) + '/100 ' + scoreStrength, bgcolor=color.new(color.gray, 70), text_color=mainColor, text_size=size.small)
+
+    // Zone
+    string zoneDisplay = priceZone == 'above_vah' ? 'Above VAH ↑' : priceZone == 'below_val' ? 'Below VAL ↓' : priceZone == 'at_poc' ? 'At POC ●' : 'In VA —'
+    color zoneCol = priceZone == 'above_vah' ? i_vahColor : priceZone == 'below_val' ? i_valColor : priceZone == 'at_poc' ? i_pocColor : color.gray
+    table.cell(tblInfo, 0, 2, 'Zone', bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    table.cell(tblInfo, 1, 2, zoneDisplay, bgcolor=color.new(zoneCol, 50), text_color=color.white, text_size=size.small)
+
+    // Trend
+    string trendDisplay = smaBullAligned ? '▲ BULL (20>50>200)' : smaBearAligned ? '▼ BEAR (20<50<200)' : '— FLAT'
+    color trendCol = smaBullAligned ? color.new(#26A69A, 30) : smaBearAligned ? color.new(#EF5350, 30) : color.new(color.gray, 50)
+    table.cell(tblInfo, 0, 3, 'Trend', bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    table.cell(tblInfo, 1, 3, trendDisplay, bgcolor=trendCol, text_color=color.white, text_size=size.small)
+
+    // POC State
+    table.cell(tblInfo, 0, 4, 'POC', bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    table.cell(tblInfo, 1, 4, pocState, bgcolor=color.new(i_pocColor, 60), text_color=color.white, text_size=size.small)
+
+    // Action Hint
+    table.cell(tblInfo, 0, 5, 'Hint', bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.small)
+    table.cell(tblInfo, 1, 5, actionGuide, bgcolor=color.new(color.gray, 80), text_color=color.yellow, text_size=size.small)
+
+    // Version
+    table.cell(tblInfo, 0, 6, 'IFA-VP', bgcolor=color.new(color.gray, 90), text_color=color.gray, text_size=size.tiny)
+    table.cell(tblInfo, 1, 6, 'v1.5 ' + i_mode, bgcolor=color.new(color.gray, 90), text_color=color.gray, text_size=size.tiny)
+
+//=============================================================================
+// ALERTS
+//=============================================================================
+
+if i_alertsEnabled and barstate.isconfirmed
+    if i_alertPoc and pocEnter
+        alert('POC ENTER: Price entered POC zone at ' + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+    if i_alertCross and goldenCross20x50
+        alert('📈 Uptrend Start (GC 20×50): ' + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+    if i_alertCross and deadCross20x50
+        alert('📉 Downtrend Start (DC 20×50): ' + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+    if i_alertCross and goldenCross50x200
+        alert('🚀 MAJOR Uptrend (GC 50×200): ' + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+    if i_alertCross and deadCross50x200
+        alert('💥 MAJOR Downtrend (DC 50×200): ' + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+    if i_alertContext and contextChanged
+        string ctxStatus = isLongFavorable ? 'LONG FAVORABLE' : isShortFavorable ? 'SHORT FAVORABLE' : 'NEUTRAL'
+        alert('Context → ' + ctxStatus + ' (Score: ' + str.tostring(contextScore) + ')', alert.freq_once_per_bar_close)
+
+// Alert conditions for TradingView alert dialog
+alertcondition(pocEnter, 'POC Enter', 'Price entered POC zone')
+alertcondition(goldenCross20x50, 'Uptrend Start', 'Golden Cross 20×50')
+alertcondition(deadCross20x50, 'Downtrend Start', 'Dead Cross 20×50')
+alertcondition(goldenCross50x200, 'MAJOR Uptrend', 'Golden Cross 50×200')
+alertcondition(deadCross50x200, 'MAJOR Downtrend', 'Dead Cross 50×200')
+alertcondition(contextChanged, 'Context Change', 'Market context changed')
+alertcondition(isLongFavorable, 'Long Favorable', 'Long favorable condition met')
+alertcondition(isShortFavorable, 'Short Favorable', 'Short favorable condition met')
