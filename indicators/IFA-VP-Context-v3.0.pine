@@ -133,11 +133,16 @@ bool i_alertContext = input.bool(true, 'Context Change', group=GROUP_ALERT)
 
 // Score color function
 f_score_color(int score) =>
-    score >= 80 ? NEON_GREEN :
-    score >= 60 ? NEON_CYAN :
-    score >= 40 ? NEON_GOLD :
-    score >= 20 ? NEON_ORANGE :
-    NEON_PINK
+    color result = NEON_PINK
+    if score >= 80
+        result := NEON_GREEN
+    else if score >= 60
+        result := NEON_CYAN
+    else if score >= 40
+        result := NEON_GOLD
+    else if score >= 20
+        result := NEON_ORANGE
+    result
 
 // Score bar function
 f_score_bar(int score) =>
